@@ -5,11 +5,13 @@
  * Parquet set, and each customer's dashboard is a set of queries over it with
  * that customer's `tenant_id` bound into every one. Here that is:
  *
- *   the grids      each has a pinned `where` predicate with a declarative twin,
- *                  so the grid pushes `WHERE tenant_id = ?` (bound) into DuckDB
- *                  with every filter, sort, quick search and page. The user's
- *                  "clear filters" cannot remove it.
- *   the KPI strip  four prepared statements, each `WHERE tenant_id = ?`.
+ *   the grids      each runs over the tenant's working set: one `CREATE TEMP TABLE
+ *                  ... WHERE tenant_id = ?` per Parquet file, tenant bound, reading
+ *                  only that tenant's row groups, once. Each filter, sort, quick
+ *                  search, group and page the grid pushes into DuckDB is then
+ *                  scoped to the tenant by construction; "clear filters" cannot
+ *                  widen it.
+ *   the KPI strip  four statements over the same working set.
  *   the charts     `source.aggregate()` over each grid's own source and current
  *                  filters, so a chart always shows what its grid shows.
  *
@@ -17,8 +19,8 @@
  */
 import { FILES, dataBase } from './config.js';
 import {
-  INVOICE_COLUMNS, INVOICE_FIELDS, KPI_SQL, TENANTS_SQL, USAGE_COLUMNS, USAGE_FIELDS,
-  fmt, invoicesFrom, num, usageFrom,
+  INVOICES_TABLE, INVOICE_COLUMNS, INVOICE_FIELDS, KPI_SQL, USAGE_TABLE, TENANTS_SQL, USAGE_COLUMNS, USAGE_FIELDS,
+  eventsScopeSql, fmt, invoicesScopeSql, num, usageScopeSql,
 } from './model.js';
 
 const el = (tag, className, text) => {
@@ -174,7 +176,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     sqlLog.push({ ...entry, label });
     if (sqlLog.length > 200) sqlLog.splice(0, sqlLog.length - 200);
     const kind = entry.sql.includes('GROUP BY ROLLUP') ? 'chart' : /\bLIMIT\b/.test(entry.sql) ? 'rows' : entry.sql.includes('__lattice_total') ? 'count' : 'other';
-    latest.set(`${label}:${kind}`, { ...entry, label });
+    latest.set(`${label}:${kind === 'other' ? entry.sql : kind}`, { ...entry, label });
     renderSql();
   });
 
@@ -191,28 +193,13 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
   /* ------------------------------------------------------------------ */
 
   /**
-   * The one place a tenant is enforced on a grid: a pinned predicate, so the
-   * grid's own "clear filters" cannot widen it, with a declarative twin so the
-   * engine gets it as a bound `tenant_id = ?` rather than the browser
-   * filtering a fetched page.
+   * The tenant scope for the grids and charts lives inside each grid's
+   * relation (`WHERE tenant_id = <id>`), so it is not a filter the visitor can
+   * clear, and DuckDB prunes row groups with it. Switching tenant builds each
+   * grid over the new relation. `epoch` counts switches, so an answer that
+   * arrives from the previous tenant is never taken for the new one.
    */
-  function scopeTenant(grid, tenantId) {
-    grid.filters.where(
-      'tenant',
-      (row) => num(row.tenant_id) === tenantId,
-      { pinned: true, deps: ['tenant_id'], condition: { col: 'tenant_id', op: 'eq', value: tenantId } },
-    );
-  }
-
-  const findTenant = (tree) => {
-    if (!tree) return null;
-    if (tree.col === 'tenant_id' && tree.op === 'eq') return num(tree.value);
-    for (const child of tree.conditions ?? []) {
-      const found = findTenant(child);
-      if (found != null) return found;
-    }
-    return null;
-  };
+  let epoch = 0;
 
   /* ------------------------------------------------------------------ */
   /* Grids                                                               */
@@ -227,14 +214,9 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
    * as the rows, and is counted by DuckDB over the whole match.
    */
   const NUMERIC_BUCKETS = 20;
-  const tenantCondition = (tenantId) => ({ col: 'tenant_id', op: 'eq', value: tenantId });
-  const withTenant = (filters, tenantId) => (filters
-    ? { op: 'and', conditions: [filters, tenantCondition(tenantId)] }
-    : tenantCondition(tenantId));
-
   async function facetCounts(source, colId, filters, quick) {
     const result = await source.aggregate(
-      { filters: withTenant(filters, built.tenantId), sort: [], range: null, groupBy: [colId], ...(quick ? { quick } : {}) },
+      { filters, sort: [], range: null, groupBy: [colId], ...(quick ? { quick } : {}) },
       [{ id: 'n', col: 'events', fn: 'count' }],
     );
     return (result.groups ?? []).filter((g) => !g.grouping?.some((flag) => flag))
@@ -244,10 +226,9 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
   async function usageFacets(request) {
     const { colId, filters, quick } = request;
     const source = built.sources.usage;
-    const [shown, all] = await Promise.all([
-      facetCounts(source, colId, filters, quick),
-      facetCounts(source, colId, null, ''),
-    ]);
+    const all = await facetCounts(source, colId, null, '');
+    const unfiltered = !filters && !quick;
+    const shown = unfiltered ? all : await facetCounts(source, colId, filters, quick);
     if (colId === 'feature') {
       const order = all.sort((a, b) => b.n - a.n);
       const shownBy = new Map(shown.map((r) => [r.key, r.n]));
@@ -288,7 +269,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     stat.textContent = state.matches == null ? '' : `${fmt.int(state.matches)} rows match · last page query ${state.ms} ms`;
   }
 
-  function mountGrid(id, { from, fields, columns, rowKey, facets, tenantId, sort }) {
+  function mountGrid(id, { from, fields, columns, rowKey, facets, sort }) {
     const adapter = LG.duckdbAdapter({ connection: labelled(id), from, fields });
     const source = LG.createPushdownSource({
       adapter,
@@ -296,23 +277,33 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
       pageSize: 100,
       aggregates: { default: 'engine-if-identical' },
     });
-    const state = { matches: null, ms: null, filters: null, tenantId: null, chartsDone: 0, chartsBefore: 0, listeners: [] };
-    built.timings[id] = state;
+    const state = (built.timings[id] ||= { matches: null, ms: null, filters: null, epoch: -1, chartsDone: 0, chartsBefore: 0, listeners: [] });
+    state.matches = null;
+    state.signature = null;
     /* The adapter's own execute is where a filter, sort, search or page lands:
        watching it is how the page learns what the grid just asked for. */
     const inner = adapter.execute.bind(adapter);
     adapter.execute = async (query, request) => {
       const started = performance.now();
+      const startedEpoch = epoch;
       const result = await inner(query, request);
       state.ms = Math.round(performance.now() - started);
       if (typeof result.total === 'number') state.matches = result.total;
-      state.filters = query.filters ?? null;
-      state.tenantId = findTenant(query.filters);
+      state.epoch = startedEpoch;
       renderStat(id);
-      void refreshCharts(id);
+      /* The charts follow the grid's own filter and search, not the request in
+         flight: a group being expanded asks a narrower question than the grid shows. */
+      const grid = built.grids[id];
+      const signature = JSON.stringify([startedEpoch, grid?.filters.get() ?? null, grid?.filters.quickState().text ?? '']);
+      if (signature !== state.signature) {
+        state.signature = signature;
+        void refreshCharts(id);
+      }
       notify(id);
       return result;
     };
+    built.grids[id]?.destroy?.();
+    views[id].host.textContent = '';
     const grid = LG.createGrid(views[id].host, {
       rowKey,
       columns,
@@ -323,7 +314,6 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     });
     built.grids[id] = grid;
     built.sources[id] = source;
-    scopeTenant(grid, tenantId);
     if (sort) grid.sort.set(sort);
   }
 
@@ -331,7 +321,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
   /* Charts, fed by the grids' own sources                               */
   /* ------------------------------------------------------------------ */
 
-  const request = (filters, groupBy) => ({ filters, sort: [], range: null, groupBy });
+  const request = (filters, groupBy, quick) => ({ filters, sort: [], range: null, groupBy, ...(quick ? { quick } : {}) });
   const realGroups = (groups) => (groups ?? []).filter((g) => !g.grouping?.some((flag) => flag));
   const dayOf = (key) => (key instanceof Date ? key : new Date(num(key))).toISOString().slice(0, 10);
 
@@ -351,11 +341,14 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
   async function refreshCharts(id) {
     const state = built.timings[id];
     const source = built.sources[id];
-    if (!source || state.tenantId !== built.tenantId) return;
+    if (!source || state.epoch !== epoch) return;
     const sequence = ++sequences[id];
+    const filters = built.grids[id].filters.get() ?? null;
+    const quick = built.grids[id].filters.quickState().text;
+    state.filters = filters;
     try {
       if (id === 'usage') {
-        const result = await source.aggregate(request(state.filters, ['feature', 'week']), [{ id: 'events', col: 'events', fn: 'sum' }]);
+        const result = await source.aggregate(request(filters, ['feature', 'week'], quick), [{ id: 'events', col: 'events', fn: 'sum' }]);
         if (sequence !== sequences.usage) return;
         const groups = realGroups(result.groups);
         const totals = new Map();
@@ -376,7 +369,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
           axis: { x: { labels: true, every: 52 }, y: 'Events' },
         });
       } else {
-        const result = await source.aggregate(request(state.filters, ['period_start']), [{ id: 'amount', col: 'amount', fn: 'sum' }]);
+        const result = await source.aggregate(request(filters, ['period_start'], quick), [{ id: 'amount', col: 'amount', fn: 'sum' }]);
         if (sequence !== sequences.invoices) return;
         const rows = realGroups(result.groups)
           .map((g) => ({ id: dayOf(g.keys[0]).slice(0, 7), month: dayOf(g.keys[0]).slice(0, 7), amount: num(g.values.amount) }))
@@ -417,15 +410,11 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     ],
   });
 
-  const kpiSql = KPI_SQL(base);
   const kpiConnection = labelled('kpi');
 
-  async function loadKpis(tenantId) {
+  async function loadKpis() {
     const one = async (key) => {
-      const statement = await kpiConnection.prepare(kpiSql[key]);
-      try {
-        return (await statement.query(tenantId)).toArray()[0].toJSON();
-      } finally { statement.close(); }
+      return (await kpiConnection.query(KPI_SQL[key])).toArray()[0].toJSON();
     };
     const [active, events, mrr, overdue] = await Promise.all([one('active'), one('events'), one('mrr'), one('overdue')]);
     built.kpis = {
@@ -441,13 +430,13 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
   /** Resolves when both grids have answered for this tenant and their charts have followed. */
   const settledFor = (tenantId) => new Promise((resolve) => {
     const check = () => {
-      if (VIEWS.every((id) => built.timings[id].tenantId === tenantId && built.timings[id].chartsDone > built.timings[id].chartsBefore)) resolve();
+      if (VIEWS.every((id) => built.timings[id].epoch === epoch && built.timings[id].chartsDone > built.timings[id].chartsBefore)) resolve();
     };
     for (const id of VIEWS) built.timings[id].listeners = [check];
     check();
   });
 
-  const describe = (tenantId) => `Every query below carries WHERE tenant_id = ${tenantId}.`;
+  const describe = (tenantId) => `Every query below is scoped to tenant_id = ${tenantId}.`;
 
   async function switchTenant(tenantId) {
     const started = performance.now();
@@ -459,14 +448,14 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     for (const id of VIEWS) {
       const s = built.timings[id];
       s.chartsBefore = s.chartsDone;
-      s.tenantId = null;
     }
+    epoch += 1;
+    await loadScope(tenantId);
+    mountViews(tenantId);
     const settled = settledFor(tenantId);
-    scopeTenant(built.grids.usage, tenantId);
-    scopeTenant(built.grids.invoices, tenantId);
-    await Promise.all([loadKpis(tenantId), settled]);
+    await Promise.all([loadKpis(), settled]);
     built.lastSwitchMs = Math.round(performance.now() - started);
-    switchTiming.textContent = `${t?.name ?? 'Tenant'} loaded in ${built.lastSwitchMs} ms: 4 KPI queries, 2 grids, 2 charts.`;
+    switchTiming.textContent = `${t?.name ?? 'Tenant'} loaded in ${built.lastSwitchMs} ms: working set, 4 KPIs, 2 grids, 2 charts.`;
     return built.lastSwitchMs;
   }
 
@@ -476,22 +465,41 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
   /* Start                                                               */
   /* ------------------------------------------------------------------ */
 
+  const scopeConnection = labelled('scope');
+  const bind = async (sql, tenantId) => {
+    if (!Number.isInteger(tenantId)) throw new Error(`not a tenant id: ${tenantId}`);
+    const statement = await scopeConnection.prepare(sql);
+    try { await statement.query(tenantId); } finally { statement.close(); }
+  };
+  /** Build the tenant's working set: the one place the tenant id is bound. */
+  const loadScope = async (tenantId) => {
+    for (const id of VIEWS) { built.grids[id]?.destroy?.(); built.grids[id] = null; views[id].host.textContent = ''; }
+    await Promise.all([bind(eventsScopeSql(base), tenantId), bind(invoicesScopeSql(base), tenantId)]);
+    await scopeConnection.query(usageScopeSql());
+  };
+
+  const mountViews = (tenantId) => {
+    mountGrid('usage', {
+      from: USAGE_TABLE, fields: USAGE_FIELDS, columns: USAGE_COLUMNS, rowKey: 'row_id',
+      facets: { enabled: true, provider: usageFacets }, sort: [{ col: 'week', dir: 'desc' }],
+    });
+    mountGrid('invoices', {
+      from: INVOICES_TABLE, fields: INVOICE_FIELDS, columns: INVOICE_COLUMNS, rowKey: 'invoice_id',
+    });
+  };
+
   built.tenantId = startTenant;
   select.value = String(startTenant);
   scopeNote.textContent = describe(startTenant);
-  mountGrid('usage', {
-    from: usageFrom(base), fields: USAGE_FIELDS, columns: USAGE_COLUMNS, rowKey: 'row_id', facets: { enabled: true, provider: usageFacets }, tenantId: startTenant, sort: [{ col: 'week', dir: 'desc' }],
-  });
-  mountGrid('invoices', {
-    from: invoicesFrom(base), fields: INVOICE_FIELDS, columns: INVOICE_COLUMNS, rowKey: 'invoice_id', tenantId: startTenant,
-  });
+  await loadScope(startTenant);
+  mountViews(startTenant);
   const opening = settledFor(startTenant);
   built.switchTenant = (id) => switchTenant(Number(id));
   built.group = (ids) => built.grids.usage.columns.group(ids);
   built.destroy = () => { for (const g of Object.values(built.grids)) g.destroy?.(); };
 
   const t0 = tenantRows.find((x) => x.tenant_id === startTenant);
-  await Promise.all([loadKpis(startTenant), opening]);
+  await Promise.all([loadKpis(), opening]);
   switchTiming.textContent = `${t0.name} loaded.`;
   return built;
 }

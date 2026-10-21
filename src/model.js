@@ -4,8 +4,8 @@
  * Three Parquet files, one tenant column. Every view is a relation over them
  * that DuckDB computes on demand: the usage grid is events grouped by feature
  * and week, the invoices grid is the invoices as billed. The tenant scope is
- * not part of any relation here: it is a pinned, bound `WHERE tenant_id = ?`
- * the page adds on top of every one of them (see `scopeTenant`).
+ * the `WHERE tenant_id = ${scope(tenantId)}` that every grid relation
+ * carries, and the `tenant_id = ?` every KPI statement binds.
  */
 import { AS_OF } from './config.js';
 
@@ -14,8 +14,25 @@ export const num = (value) => (typeof value === 'bigint' ? Number(value) : (valu
 
 const quote = (url) => `'${String(url).replace(/'/g, "''")}'`;
 
-/** Events per feature per week, for every tenant. The tenant predicate is applied on top, and pushed below the GROUP BY. */
-export const usageFrom = (base) => `(
+/**
+ * The tenant's working set. One statement per table, with the tenant bound as
+ * `?`: DuckDB reads only the Parquet row groups that hold that tenant's rows
+ * and keeps the (small) result as a temporary table. Every grid, histogram and
+ * chart then queries that table, so the tenant scope is not something a filter
+ * can remove, and a filter change costs milliseconds, not another Parquet read.
+ */
+export const EVENTS_TABLE = 'tenant_events';
+export const USAGE_TABLE = 'tenant_usage';
+export const INVOICES_TABLE = 'tenant_invoices';
+
+/** The one read of the big file: this tenant's events, tenant bound as `?`. */
+export const eventsScopeSql = (base) => `CREATE OR REPLACE TEMP TABLE ${EVENTS_TABLE} AS
+  SELECT tenant_id, user_id, feature, event_time, duration_ms, status
+  FROM read_parquet(${quote(`${base}usage_events.parquet`)})
+  WHERE tenant_id = ?`;
+
+/** Events per feature per week, from the tenant's own events. */
+export const usageScopeSql = () => `CREATE OR REPLACE TEMP TABLE ${USAGE_TABLE} AS
   SELECT tenant_id, feature,
          CAST(date_trunc('week', event_time) AS DATE) AS week,
          CAST(count(*) AS INTEGER) AS events,
@@ -23,17 +40,16 @@ export const usageFrom = (base) => `(
          CAST(round(avg(duration_ms)) AS INTEGER) AS avg_ms,
          CAST(sum(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) AS INTEGER) AS failures,
          feature || ' ' || CAST(CAST(date_trunc('week', event_time) AS DATE) AS VARCHAR) AS row_id
-  FROM read_parquet(${quote(`${base}usage_events.parquet`)})
-  GROUP BY tenant_id, feature, CAST(date_trunc('week', event_time) AS DATE)
-)`;
+  FROM ${EVENTS_TABLE}
+  GROUP BY tenant_id, feature, CAST(date_trunc('week', event_time) AS DATE)`;
 
 /** The invoices as billed, with how long the open ones have been overdue as of the data's last day. */
-export const invoicesFrom = (base) => `(
+export const invoicesScopeSql = (base) => `CREATE OR REPLACE TEMP TABLE ${INVOICES_TABLE} AS
   SELECT invoice_id, 'INV-' || lpad(CAST(invoice_id AS VARCHAR), 6, '0') AS invoice, tenant_id, period_start, due_date, seats,
          CAST(amount AS DOUBLE) AS amount, status, paid_date,
          CASE WHEN status = 'overdue' THEN CAST(DATE '${AS_OF}' - due_date AS INTEGER) END AS days_overdue
   FROM read_parquet(${quote(`${base}invoices.parquet`)})
-)`;
+  WHERE tenant_id = ?`;
 
 export const USAGE_FIELDS = ['row_id', 'tenant_id', 'feature', 'week', 'events', 'active_users', 'avg_ms', 'failures'];
 export const INVOICE_FIELDS = ['invoice_id', 'invoice', 'tenant_id', 'period_start', 'due_date', 'seats', 'amount', 'status', 'paid_date', 'days_overdue'];
@@ -77,21 +93,17 @@ export const fmt = {
   ms: (n) => (n == null ? '—' : `${Math.round(n)} ms`),
 };
 
-/** The KPI strip's queries. Every one binds the tenant with `?`. */
-export const KPI_SQL = (base) => ({
-  active: `SELECT CAST(count(DISTINCT user_id) AS INTEGER) AS v
-           FROM read_parquet(${quote(`${base}usage_events.parquet`)})
-           WHERE tenant_id = ? AND event_time >= TIMESTAMP '${AS_OF}' + INTERVAL 1 DAY - INTERVAL 30 DAY`,
-  events: `SELECT CAST(count(*) AS INTEGER) AS v
-           FROM read_parquet(${quote(`${base}usage_events.parquet`)})
-           WHERE tenant_id = ? AND event_time >= TIMESTAMP '${AS_OF}' + INTERVAL 1 DAY - INTERVAL 30 DAY`,
-  mrr: `SELECT CAST(coalesce(sum(amount), 0) AS DOUBLE) AS v
-        FROM read_parquet(${quote(`${base}invoices.parquet`)})
-        WHERE tenant_id = ? AND period_start = date_trunc('month', DATE '${AS_OF}')`,
-  overdue: `SELECT CAST(count(*) AS INTEGER) AS v, CAST(coalesce(sum(amount), 0) AS DOUBLE) AS total
-            FROM read_parquet(${quote(`${base}invoices.parquet`)})
-            WHERE tenant_id = ? AND status = 'overdue'`,
-});
+/** The KPI strip's queries, over the tenant's working set. */
+export const KPI_SQL = {
+  active: `SELECT CAST(count(DISTINCT user_id) AS INTEGER) AS v FROM ${EVENTS_TABLE}
+           WHERE event_time >= TIMESTAMP '${AS_OF}' + INTERVAL 1 DAY - INTERVAL 30 DAY`,
+  events: `SELECT CAST(count(*) AS INTEGER) AS v FROM ${EVENTS_TABLE}
+           WHERE event_time >= TIMESTAMP '${AS_OF}' + INTERVAL 1 DAY - INTERVAL 30 DAY`,
+  mrr: `SELECT CAST(coalesce(sum(amount), 0) AS DOUBLE) AS v FROM ${INVOICES_TABLE}
+        WHERE period_start = date_trunc('month', DATE '${AS_OF}')`,
+  overdue: `SELECT CAST(count(*) AS INTEGER) AS v, CAST(coalesce(sum(amount), 0) AS DOUBLE) AS total FROM ${INVOICES_TABLE}
+            WHERE status = 'overdue'`,
+};
 
 /** The tenant list for the switcher. Small: one row per tenant. */
 export const TENANTS_SQL = (base) => `SELECT tenant_id, name, plan, region, signup_date, churn_date FROM read_parquet(${quote(`${base}tenants.parquet`)}) ORDER BY name, tenant_id`;
