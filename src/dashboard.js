@@ -207,62 +207,6 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
 
   const notify = (id) => built.timings[id].listeners?.forEach((fn) => fn());
 
-  /**
-   * Header histograms. The grid cannot count a source it does not hold, so it
-   * asks for the counts: each answer is one grouped query through the same
-   * source, so the histogram obeys the same filters, search and tenant scope
-   * as the rows, and is counted by DuckDB over the whole match.
-   */
-  const NUMERIC_BUCKETS = 20;
-  async function facetCounts(source, colId, filters, quick) {
-    const result = await source.aggregate(
-      { filters, sort: [], range: null, groupBy: [colId], ...(quick ? { quick } : {}) },
-      [{ id: 'n', col: 'events', fn: 'count' }],
-    );
-    return (result.groups ?? []).filter((g) => !g.grouping?.some((flag) => flag))
-      .map((g) => ({ key: g.keys[0], n: num(g.values.n) }));
-  }
-
-  async function usageFacets(request) {
-    const { colId, filters, quick } = request;
-    const source = built.sources.usage;
-    const all = await facetCounts(source, colId, null, '');
-    const unfiltered = !filters && !quick;
-    const shown = unfiltered ? all : await facetCounts(source, colId, filters, quick);
-    if (colId === 'feature') {
-      const order = all.sort((a, b) => b.n - a.n);
-      const shownBy = new Map(shown.map((r) => [r.key, r.n]));
-      return {
-        bounds: { kind: 'category', cardinality: order.length, buckets: order.map((r) => ({ value: r.key, label: String(r.key) })) },
-        counts: order.map((r) => shownBy.get(r.key) ?? 0),
-        unfiltered: order.map((r) => r.n),
-      };
-    }
-    const keyed = (rows) => rows.filter((r) => r.key != null).map((r) => ({ x: r.key instanceof Date ? r.key.getTime() : num(r.key), n: r.n }));
-    const every = keyed(all);
-    if (every.length === 0) return { bounds: { kind: 'none', buckets: [] }, counts: [], unfiltered: [] };
-    const min = Math.min(...every.map((r) => r.x));
-    const max = Math.max(...every.map((r) => r.x));
-    const bins = max === min ? 1 : NUMERIC_BUCKETS;
-    const width = (max - min) / bins || 1;
-    const place = (rows) => {
-      const out = new Array(bins).fill(0);
-      for (const r of rows) out[Math.min(bins - 1, Math.floor((r.x - min) / width))] += r.n;
-      return out;
-    };
-    return {
-      bounds: {
-        kind: colId === 'week' ? 'date' : 'numeric',
-        ...(colId === 'week' ? { granularity: 'month' } : { strategy: 'equal' }),
-        min,
-        max,
-        buckets: Array.from({ length: bins }, (_, i) => ({ from: min + i * width, to: i === bins - 1 ? max : min + (i + 1) * width })),
-      },
-      counts: place(keyed(shown)),
-      unfiltered: place(every),
-    };
-  }
-
   function renderStat(id) {
     const state = built.timings[id];
     const stat = views[id].stat;
@@ -481,7 +425,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
   const mountViews = (tenantId) => {
     mountGrid('usage', {
       from: USAGE_TABLE, fields: USAGE_FIELDS, columns: USAGE_COLUMNS, rowKey: 'row_id',
-      facets: { enabled: true, provider: usageFacets }, sort: [{ col: 'week', dir: 'desc' }],
+      facets: { enabled: true }, sort: [{ col: 'week', dir: 'desc' }],
     });
     mountGrid('invoices', {
       from: INVOICES_TABLE, fields: INVOICE_FIELDS, columns: INVOICE_COLUMNS, rowKey: 'invoice_id',
