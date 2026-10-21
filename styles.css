@@ -1,0 +1,161 @@
+/* The page around the grids. The grid brings its own stylesheet and follows data-theme. */
+
+:root {
+  --ground: #ffffff;
+  --surface: #f5f7fa;
+  --ink: #15191e;
+  --ink-2: #48525d;
+  --ink-3: #6b7681;
+  --rule: #d9dee4;
+  --accent: #1a62b8;
+  --accent-ink: #ffffff;
+  --code-bg: #101722;
+  --code-ink: #d3e2f2;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  --ground: #0f1419;
+  --surface: #171e26;
+  --ink: #e8edf2;
+  --ink-2: #aab5c0;
+  --ink-3: #8794a1;
+  --rule: #2b3541;
+  --accent: #5aa2ee;
+  --accent-ink: #0b1118;
+  --code-bg: #0a0f15;
+  --code-ink: #c3d4e6;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font: 15px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 28px 24px 72px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+/* ---------------------------------------------------------- loading */
+.loading { max-width: 640px; margin: 18vh auto; padding: 0 20px; text-align: center; }
+.loading h1 { font-size: 1.5rem; margin: 0 0 10px; }
+.loading-message { color: var(--ink-2); margin: 6px 0; }
+
+/* -------------------------------------------------------- masthead */
+.masthead { border-bottom: 2px solid var(--ink); padding-bottom: 16px; }
+.title-row { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; }
+.masthead h1 {
+  font-size: clamp(1.45rem, 3vw, 2.1rem);
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+  margin: 0 0 10px;
+}
+.lede { margin: 0; color: var(--ink-2); max-width: 78ch; }
+.theme-toggle {
+  flex: none;
+  font: 13px var(--sans);
+  padding: 6px 12px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.theme-toggle:hover { border-color: var(--accent); }
+
+/* ------------------------------------------------------ tenant bar */
+.tenant-bar {
+  display: grid;
+  grid-template-columns: auto minmax(260px, 420px) 1fr;
+  gap: 6px 14px;
+  align-items: center;
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  background: var(--surface);
+  padding: 14px 16px;
+}
+.tenant-label { font-weight: 600; font-size: 14px; }
+.tenant-select {
+  font: 14px var(--sans);
+  padding: 8px 10px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: var(--ground);
+  color: var(--ink);
+  width: 100%;
+  min-width: 0;
+}
+.scope-note, .switch-timing { margin: 0; font: 12.5px/1.45 var(--mono); color: var(--ink-2); }
+.scope-note { grid-column: 3; }
+.switch-timing { grid-column: 2 / -1; color: var(--ink-3); }
+
+/* ------------------------------------------------------------- KPIs */
+.kpi-strip { min-height: 96px; }
+
+/* ----------------------------------------------------------- charts */
+.charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.chart-box {
+  height: 340px;
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  padding: 8px;
+  background: var(--ground);
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------ views */
+.view { display: flex; flex-direction: column; gap: 6px; }
+.view-head { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: baseline; }
+.view-head h2 { font-size: 1.15rem; margin: 0; }
+.view-stat { margin: 0; font: 12.5px var(--mono); color: var(--ink-3); }
+.view-note { margin: 0 0 4px; color: var(--ink-2); font-size: 14px; max-width: 96ch; }
+.grid-host {
+  height: 560px;
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.view[data-view="invoices"] .grid-host { height: 420px; }
+
+/* -------------------------------------------------------- the SQL */
+.sql-panel { border: 1px solid var(--rule); border-radius: 9px; background: var(--surface); padding: 12px 16px; }
+.sql-panel summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+.plan-sql {
+  margin: 12px 0 0;
+  background: var(--code-bg);
+  color: var(--code-ink);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font: 11.5px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 380px;
+  overflow: auto;
+}
+
+/* -------------------------------------------------------- colophon */
+.colophon { font-size: 12.5px; color: var(--ink-3); border-top: 1px solid var(--rule); padding-top: 14px; max-width: 96ch; }
+.colophon a { color: var(--accent); }
+
+/* ----------------------------------------------------------- narrow */
+@media (max-width: 900px) {
+  .app { padding: 20px 14px 56px; }
+  .charts { grid-template-columns: minmax(0, 1fr); }
+  .tenant-bar { grid-template-columns: minmax(0, 1fr); }
+  .scope-note, .switch-timing { grid-column: 1; }
+  .grid-host, .view[data-view="invoices"] .grid-host { height: 440px; }
+  .title-row { flex-direction: column; gap: 8px; }
+}

@@ -2,3 +2,4 @@ node_modules/
 .scratch-12009/
 data/**/*.parquet
 data/**/.tmp*
+.scratch-12011/

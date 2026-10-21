@@ -1,0 +1,497 @@
+/**
+ * The dashboard: one tenant's view of the product, served from Parquet.
+ *
+ * The idea the page demonstrates: an application with many customers keeps one
+ * Parquet set, and each customer's dashboard is a set of queries over it with
+ * that customer's `tenant_id` bound into every one. Here that is:
+ *
+ *   the grids      each has a pinned `where` predicate with a declarative twin,
+ *                  so the grid pushes `WHERE tenant_id = ?` (bound) into DuckDB
+ *                  with every filter, sort, quick search and page. The user's
+ *                  "clear filters" cannot remove it.
+ *   the KPI strip  four prepared statements, each `WHERE tenant_id = ?`.
+ *   the charts     `source.aggregate()` over each grid's own source and current
+ *                  filters, so a chart always shows what its grid shows.
+ *
+ * Switching tenant changes one value and re-runs the views.
+ */
+import { FILES, dataBase } from './config.js';
+import {
+  INVOICE_COLUMNS, INVOICE_FIELDS, KPI_SQL, TENANTS_SQL, USAGE_COLUMNS, USAGE_FIELDS,
+  fmt, invoicesFrom, num, usageFrom,
+} from './model.js';
+
+const el = (tag, className, text) => {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+};
+
+const TOP_FEATURES = 6;
+const VIEWS = ['usage', 'invoices'];
+
+export async function buildDashboard({ root, LG, createChart, createKPI, connection, recordSql, duckdbVersion }) {
+  const base = dataBase();
+  const built = {
+    ready: false,
+    base,
+    tenantId: null,
+    tenants: [],
+    kpi: null,
+    kpis: null,
+    charts: {},
+    chartGrids: {},
+    grids: {},
+    sources: {},
+    timings: {},
+    lastSwitchMs: null,
+    duckdbVersion,
+    files: FILES,
+  };
+
+  /* ------------------------------------------------------------------ */
+  /* The tenant list                                                     */
+  /* ------------------------------------------------------------------ */
+
+  const tenantRows = (await connection.query(TENANTS_SQL(base))).toArray().map((r) => {
+    const row = r.toJSON();
+    return {
+      tenant_id: num(row.tenant_id), name: String(row.name), plan: String(row.plan), region: String(row.region),
+      churned: row.churn_date != null,
+    };
+  });
+  built.tenants = tenantRows;
+  /* The account to open on: the oldest active enterprise tenant. */
+  const firstOpen = (await connection.query(
+    `SELECT tenant_id FROM read_parquet('${base}tenants.parquet')
+     WHERE plan = 'enterprise' AND churn_date IS NULL ORDER BY signup_date, tenant_id LIMIT 1`,
+  )).toArray()[0];
+  const startTenant = firstOpen ? num(firstOpen.toJSON().tenant_id) : tenantRows[0].tenant_id;
+
+  /* ------------------------------------------------------------------ */
+  /* The frame                                                           */
+  /* ------------------------------------------------------------------ */
+
+  root.textContent = '';
+  root.className = 'app';
+
+  const header = el('header', 'masthead');
+  const titleRow = el('div', 'title-row');
+  titleRow.append(el('h1', null, 'Your customers’ dashboards, served from Parquet'));
+  const themeButton = el('button', 'theme-toggle', 'Dark mode');
+  themeButton.type = 'button';
+  themeButton.dataset.themeToggle = '';
+  titleRow.append(themeButton);
+  header.append(titleRow);
+  header.append(el(
+    'p', 'lede',
+    'Every account in a SaaS product shares one set of Parquet files. Pick a customer and each view below '
+    + 'runs a query with that customer’s id bound into the WHERE clause, inside DuckDB in your browser: '
+    + 'usage, invoices and charts, scoped to one tenant and re-scoped in about a second when you switch.',
+  ));
+  root.append(header);
+
+  const tenantBar = el('section', 'tenant-bar');
+  tenantBar.setAttribute('aria-label', 'Tenant');
+  const switchLabel = el('label', 'tenant-label', 'Customer');
+  switchLabel.htmlFor = 'tenant-select';
+  const select = el('select', 'tenant-select');
+  select.id = 'tenant-select';
+  select.dataset.tenant = '';
+  for (const t of tenantRows) {
+    const option = el('option', null, `${t.name} · ${t.plan} · ${t.region}${t.churned ? ' · churned' : ''}`);
+    option.value = String(t.tenant_id);
+    select.append(option);
+  }
+  const scopeNote = el('p', 'scope-note');
+  scopeNote.dataset.scope = '';
+  const switchTiming = el('p', 'switch-timing');
+  switchTiming.dataset.switchTiming = '';
+  tenantBar.append(switchLabel, select, scopeNote, switchTiming);
+  root.append(tenantBar);
+
+  const kpiHost = el('section', 'kpi-strip');
+  kpiHost.setAttribute('aria-label', 'Key figures for this tenant');
+  root.append(kpiHost);
+
+  const chartSection = el('section', 'charts');
+  chartSection.setAttribute('aria-label', 'Charts');
+  const chartBoxes = {};
+  for (const id of ['adoption', 'mrr']) {
+    const box = el('div', 'chart-box');
+    box.dataset.chart = id;
+    chartSection.append(box);
+    chartBoxes[id] = box;
+  }
+  root.append(chartSection);
+
+  const viewSection = (id, title, blurb) => {
+    const section = el('section', 'view');
+    section.dataset.view = id;
+    const head = el('div', 'view-head');
+    head.append(el('h2', null, title));
+    const stat = el('p', 'view-stat');
+    stat.dataset.viewStat = id;
+    head.append(stat);
+    section.append(head, el('p', 'view-note', blurb));
+    const host = el('div', 'grid-host');
+    host.dataset.grid = id;
+    section.append(host);
+    root.append(section);
+    return { host, stat };
+  };
+  const views = {
+    usage: viewSection('usage', 'Usage', 'Events by feature by week. Type in the search box, filter a column, click a histogram bar, or group by feature: each of those becomes SQL.'),
+    invoices: viewSection('invoices', 'Invoices', 'One invoice per month for paying tenants. Free-plan tenants have none.'),
+  };
+
+  const sqlPanel = el('details', 'sql-panel');
+  sqlPanel.dataset.sqlPanel = '';
+  const sqlPre = el('pre', 'plan-sql');
+  sqlPre.dataset.planSql = '';
+  sqlPanel.append(el('summary', null, 'The queries behind these views'), sqlPre);
+  root.append(sqlPanel);
+
+  const footer = el('footer', 'colophon');
+  footer.append(
+    'Synthetic data: ', el('strong', null, 'no real customers or people'),
+    '. DuckDB-Wasm reads the Parquet files over HTTP range requests; only the row groups holding the '
+    + 'selected tenant’s rows are fetched. ',
+  );
+  const code = el('a', null, 'Source and data dictionary');
+  code.href = 'https://github.com/toclocoinc/lattice-grid-demo-duckdb-saas-analytics';
+  footer.append(code, '.');
+  root.append(footer);
+
+  /* ------------------------------------------------------------------ */
+  /* The queries the page ran, recorded                                  */
+  /* ------------------------------------------------------------------ */
+
+  const sqlLog = [];
+  const latest = new Map();
+  const labelled = (label) => recordSql(connection, (entry) => {
+    sqlLog.push({ ...entry, label });
+    if (sqlLog.length > 200) sqlLog.splice(0, sqlLog.length - 200);
+    const kind = entry.sql.includes('GROUP BY ROLLUP') ? 'chart' : /\bLIMIT\b/.test(entry.sql) ? 'rows' : entry.sql.includes('__lattice_total') ? 'count' : 'other';
+    latest.set(`${label}:${kind}`, { ...entry, label });
+    renderSql();
+  });
+
+  function renderSql() {
+    sqlPre.textContent = [...latest.values()].map((e) => {
+      const sql = e.sql.replace(/\s+/g, ' ').replace(/ (FROM|WHERE|GROUP BY|ORDER BY|LIMIT|OFFSET) /g, '\n$1 ');
+      const bound = e.params?.length ? `\n-- bound: ${JSON.stringify(e.params.map((p) => (typeof p === 'bigint' ? Number(p) : p)))}` : '';
+      return `-- ${e.label} · ${e.ms} ms · ${fmt.int(e.rows)} rows back\n${sql}${bound}`;
+    }).join('\n\n');
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* The tenant scope                                                    */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * The one place a tenant is enforced on a grid: a pinned predicate, so the
+   * grid's own "clear filters" cannot widen it, with a declarative twin so the
+   * engine gets it as a bound `tenant_id = ?` rather than the browser
+   * filtering a fetched page.
+   */
+  function scopeTenant(grid, tenantId) {
+    grid.filters.where(
+      'tenant',
+      (row) => num(row.tenant_id) === tenantId,
+      { pinned: true, deps: ['tenant_id'], condition: { col: 'tenant_id', op: 'eq', value: tenantId } },
+    );
+  }
+
+  const findTenant = (tree) => {
+    if (!tree) return null;
+    if (tree.col === 'tenant_id' && tree.op === 'eq') return num(tree.value);
+    for (const child of tree.conditions ?? []) {
+      const found = findTenant(child);
+      if (found != null) return found;
+    }
+    return null;
+  };
+
+  /* ------------------------------------------------------------------ */
+  /* Grids                                                               */
+  /* ------------------------------------------------------------------ */
+
+  const notify = (id) => built.timings[id].listeners?.forEach((fn) => fn());
+
+  /**
+   * Header histograms. The grid cannot count a source it does not hold, so it
+   * asks for the counts: each answer is one grouped query through the same
+   * source, so the histogram obeys the same filters, search and tenant scope
+   * as the rows, and is counted by DuckDB over the whole match.
+   */
+  const NUMERIC_BUCKETS = 20;
+  const tenantCondition = (tenantId) => ({ col: 'tenant_id', op: 'eq', value: tenantId });
+  const withTenant = (filters, tenantId) => (filters
+    ? { op: 'and', conditions: [filters, tenantCondition(tenantId)] }
+    : tenantCondition(tenantId));
+
+  async function facetCounts(source, colId, filters, quick) {
+    const result = await source.aggregate(
+      { filters: withTenant(filters, built.tenantId), sort: [], range: null, groupBy: [colId], ...(quick ? { quick } : {}) },
+      [{ id: 'n', col: 'events', fn: 'count' }],
+    );
+    return (result.groups ?? []).filter((g) => !g.grouping?.some((flag) => flag))
+      .map((g) => ({ key: g.keys[0], n: num(g.values.n) }));
+  }
+
+  async function usageFacets(request) {
+    const { colId, filters, quick } = request;
+    const source = built.sources.usage;
+    const [shown, all] = await Promise.all([
+      facetCounts(source, colId, filters, quick),
+      facetCounts(source, colId, null, ''),
+    ]);
+    if (colId === 'feature') {
+      const order = all.sort((a, b) => b.n - a.n);
+      const shownBy = new Map(shown.map((r) => [r.key, r.n]));
+      return {
+        bounds: { kind: 'category', cardinality: order.length, buckets: order.map((r) => ({ value: r.key, label: String(r.key) })) },
+        counts: order.map((r) => shownBy.get(r.key) ?? 0),
+        unfiltered: order.map((r) => r.n),
+      };
+    }
+    const keyed = (rows) => rows.filter((r) => r.key != null).map((r) => ({ x: r.key instanceof Date ? r.key.getTime() : num(r.key), n: r.n }));
+    const every = keyed(all);
+    if (every.length === 0) return { bounds: { kind: 'none', buckets: [] }, counts: [], unfiltered: [] };
+    const min = Math.min(...every.map((r) => r.x));
+    const max = Math.max(...every.map((r) => r.x));
+    const bins = max === min ? 1 : NUMERIC_BUCKETS;
+    const width = (max - min) / bins || 1;
+    const place = (rows) => {
+      const out = new Array(bins).fill(0);
+      for (const r of rows) out[Math.min(bins - 1, Math.floor((r.x - min) / width))] += r.n;
+      return out;
+    };
+    return {
+      bounds: {
+        kind: colId === 'week' ? 'date' : 'numeric',
+        ...(colId === 'week' ? { granularity: 'month' } : { strategy: 'equal' }),
+        min,
+        max,
+        buckets: Array.from({ length: bins }, (_, i) => ({ from: min + i * width, to: i === bins - 1 ? max : min + (i + 1) * width })),
+      },
+      counts: place(keyed(shown)),
+      unfiltered: place(every),
+    };
+  }
+
+  function renderStat(id) {
+    const state = built.timings[id];
+    const stat = views[id].stat;
+    stat.textContent = state.matches == null ? '' : `${fmt.int(state.matches)} rows match · last page query ${state.ms} ms`;
+  }
+
+  function mountGrid(id, { from, fields, columns, rowKey, facets, tenantId, sort }) {
+    const adapter = LG.duckdbAdapter({ connection: labelled(id), from, fields });
+    const source = LG.createPushdownSource({
+      adapter,
+      compute: LG,
+      pageSize: 100,
+      aggregates: { default: 'engine-if-identical' },
+    });
+    const state = { matches: null, ms: null, filters: null, tenantId: null, chartsDone: 0, chartsBefore: 0, listeners: [] };
+    built.timings[id] = state;
+    /* The adapter's own execute is where a filter, sort, search or page lands:
+       watching it is how the page learns what the grid just asked for. */
+    const inner = adapter.execute.bind(adapter);
+    adapter.execute = async (query, request) => {
+      const started = performance.now();
+      const result = await inner(query, request);
+      state.ms = Math.round(performance.now() - started);
+      if (typeof result.total === 'number') state.matches = result.total;
+      state.filters = query.filters ?? null;
+      state.tenantId = findTenant(query.filters);
+      renderStat(id);
+      void refreshCharts(id);
+      notify(id);
+      return result;
+    };
+    const grid = LG.createGrid(views[id].host, {
+      rowKey,
+      columns,
+      source,
+      ...(facets ? { facets } : {}),
+      toolPanel: { side: 'right', panels: ['filters', 'columns'] },
+      showTotalInHeader: true,
+    });
+    built.grids[id] = grid;
+    built.sources[id] = source;
+    scopeTenant(grid, tenantId);
+    if (sort) grid.sort.set(sort);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Charts, fed by the grids' own sources                               */
+  /* ------------------------------------------------------------------ */
+
+  const request = (filters, groupBy) => ({ filters, sort: [], range: null, groupBy });
+  const realGroups = (groups) => (groups ?? []).filter((g) => !g.grouping?.some((flag) => flag));
+  const dayOf = (key) => (key instanceof Date ? key : new Date(num(key))).toISOString().slice(0, 10);
+
+  function feed(id, columns, rows, spec) {
+    if (built.chartGrids[id]) {
+      built.chartGrids[id].rows.load(rows);
+      built.charts[id]?.refresh?.();
+      return;
+    }
+    const grid = LG.createHeadlessGrid({ rowKey: 'id', columns, rows });
+    built.chartGrids[id] = grid;
+    built.charts[id] = createChart({ grid, container: chartBoxes[id], legend: true, ...spec });
+  }
+
+  const sequences = { usage: 0, invoices: 0 };
+
+  async function refreshCharts(id) {
+    const state = built.timings[id];
+    const source = built.sources[id];
+    if (!source || state.tenantId !== built.tenantId) return;
+    const sequence = ++sequences[id];
+    try {
+      if (id === 'usage') {
+        const result = await source.aggregate(request(state.filters, ['feature', 'week']), [{ id: 'events', col: 'events', fn: 'sum' }]);
+        if (sequence !== sequences.usage) return;
+        const groups = realGroups(result.groups);
+        const totals = new Map();
+        for (const g of groups) totals.set(g.keys[0], (totals.get(g.keys[0]) ?? 0) + num(g.values.events));
+        const top = new Set([...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_FEATURES).map(([f]) => f));
+        const cells = new Map();
+        for (const g of groups) {
+          const feature = top.has(g.keys[0]) ? String(g.keys[0]) : 'other';
+          const week = dayOf(g.keys[1]);
+          const key = `${feature}|${week}`;
+          cells.set(key, { id: key, feature, week, events: (cells.get(key)?.events ?? 0) + num(g.values.events) });
+        }
+        const rows = [...cells.values()].sort((a, b) => a.week.localeCompare(b.week) || a.feature.localeCompare(b.feature));
+        feed('adoption', [{ field: 'id' }, { field: 'feature' }, { field: 'week' }, { field: 'events', type: 'number' }], rows, {
+          type: 'bar', x: 'week', y: 'events', series: 'feature', stack: true,
+          title: 'Feature adoption over time',
+          subtitle: `Events per week, top ${TOP_FEATURES} features; follows the usage grid’s filters`,
+          axis: { x: { labels: true, every: 52 }, y: 'Events' },
+        });
+      } else {
+        const result = await source.aggregate(request(state.filters, ['period_start']), [{ id: 'amount', col: 'amount', fn: 'sum' }]);
+        if (sequence !== sequences.invoices) return;
+        const rows = realGroups(result.groups)
+          .map((g) => ({ id: dayOf(g.keys[0]).slice(0, 7), month: dayOf(g.keys[0]).slice(0, 7), amount: num(g.values.amount) }))
+          .filter((r) => r.amount != null)
+          .sort((a, b) => a.month.localeCompare(b.month));
+        feed('mrr', [{ field: 'id' }, { field: 'month' }, { field: 'amount', type: 'number' }], rows, {
+          type: 'bar', x: 'month', y: 'amount',
+          title: 'MRR by month',
+          subtitle: 'Invoiced amount in USD; follows the invoices grid’s filters',
+          axis: { x: { labels: true, every: 12 }, y: 'USD' },
+        });
+      }
+      state.chartsDone += 1;
+      notify(id);
+    } catch (error) {
+      console.error('[saas demo] chart', id, error);
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* The KPI strip                                                       */
+  /* ------------------------------------------------------------------ */
+
+  built.kpi = createKPI(kpiHost, {
+    rows: [],
+    rowKey: 'id',
+    columns: 4,
+    ariaLabel: 'Key figures for this tenant',
+    nullText: '—',
+    tiles: [
+      { id: 'active', label: 'Active users, last 30 days', aggregation: 'max', field: 'active', format: { type: 'number', decimals: 0 } },
+      { id: 'events', label: 'Events, last 30 days', aggregation: 'max', field: 'events', format: { type: 'number', decimals: 0 } },
+      { id: 'mrr', label: 'MRR, September 2026', aggregation: 'max', field: 'mrr', format: { type: 'currency', currency: 'USD', decimals: 0 } },
+      {
+        id: 'overdue', label: 'Overdue invoices', aggregation: 'max', field: 'overdue', format: { type: 'number', decimals: 0 },
+        thresholds: { warn: 1, critical: 3, direction: 'lowerIsBetter' },
+      },
+    ],
+  });
+
+  const kpiSql = KPI_SQL(base);
+  const kpiConnection = labelled('kpi');
+
+  async function loadKpis(tenantId) {
+    const one = async (key) => {
+      const statement = await kpiConnection.prepare(kpiSql[key]);
+      try {
+        return (await statement.query(tenantId)).toArray()[0].toJSON();
+      } finally { statement.close(); }
+    };
+    const [active, events, mrr, overdue] = await Promise.all([one('active'), one('events'), one('mrr'), one('overdue')]);
+    built.kpis = {
+      active: num(active.v), events: num(events.v), mrr: num(mrr.v), overdue: num(overdue.v), overdueAmount: num(overdue.total),
+    };
+    built.kpi.setRows([{ id: 'now', ...built.kpis }]);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Switching                                                           */
+  /* ------------------------------------------------------------------ */
+
+  /** Resolves when both grids have answered for this tenant and their charts have followed. */
+  const settledFor = (tenantId) => new Promise((resolve) => {
+    const check = () => {
+      if (VIEWS.every((id) => built.timings[id].tenantId === tenantId && built.timings[id].chartsDone > built.timings[id].chartsBefore)) resolve();
+    };
+    for (const id of VIEWS) built.timings[id].listeners = [check];
+    check();
+  });
+
+  const describe = (tenantId) => `Every query below carries WHERE tenant_id = ${tenantId}.`;
+
+  async function switchTenant(tenantId) {
+    const started = performance.now();
+    built.tenantId = tenantId;
+    const t = tenantRows.find((x) => x.tenant_id === tenantId);
+    select.value = String(tenantId);
+    scopeNote.textContent = describe(tenantId);
+    switchTiming.textContent = 'Loading…';
+    for (const id of VIEWS) {
+      const s = built.timings[id];
+      s.chartsBefore = s.chartsDone;
+      s.tenantId = null;
+    }
+    const settled = settledFor(tenantId);
+    scopeTenant(built.grids.usage, tenantId);
+    scopeTenant(built.grids.invoices, tenantId);
+    await Promise.all([loadKpis(tenantId), settled]);
+    built.lastSwitchMs = Math.round(performance.now() - started);
+    switchTiming.textContent = `${t?.name ?? 'Tenant'} loaded in ${built.lastSwitchMs} ms: 4 KPI queries, 2 grids, 2 charts.`;
+    return built.lastSwitchMs;
+  }
+
+  select.addEventListener('change', () => { void switchTenant(Number(select.value)); });
+
+  /* ------------------------------------------------------------------ */
+  /* Start                                                               */
+  /* ------------------------------------------------------------------ */
+
+  built.tenantId = startTenant;
+  select.value = String(startTenant);
+  scopeNote.textContent = describe(startTenant);
+  mountGrid('usage', {
+    from: usageFrom(base), fields: USAGE_FIELDS, columns: USAGE_COLUMNS, rowKey: 'row_id', facets: { enabled: true, provider: usageFacets }, tenantId: startTenant, sort: [{ col: 'week', dir: 'desc' }],
+  });
+  mountGrid('invoices', {
+    from: invoicesFrom(base), fields: INVOICE_FIELDS, columns: INVOICE_COLUMNS, rowKey: 'invoice_id', tenantId: startTenant,
+  });
+  const opening = settledFor(startTenant);
+  built.switchTenant = (id) => switchTenant(Number(id));
+  built.group = (ids) => built.grids.usage.columns.group(ids);
+  built.destroy = () => { for (const g of Object.values(built.grids)) g.destroy?.(); };
+
+  const t0 = tenantRows.find((x) => x.tenant_id === startTenant);
+  await Promise.all([loadKpis(startTenant), opening]);
+  switchTiming.textContent = `${t0.name} loaded.`;
+  return built;
+}
