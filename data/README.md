@@ -1,0 +1,94 @@
+# Demo data
+
+**Synthetic data, MIT licensed, no real people.** Every row is produced by `tools/generate.mjs` from a seeded PRNG. Tenant names are combinations of a small word list; users are numeric ids with a role, with no names, emails or phone numbers.
+
+## Generate
+
+```
+npm install
+node tools/generate.mjs                  # full: ~20M events, writes data/*.parquet
+node tools/generate.mjs --scale small    # ~1M events, writes data/small/*.parquet
+node tools/generate.mjs --scale tiny     # ~30k events (used by the tests)
+# options: --seed 42  --out <dir>
+```
+
+The same seed and scale give byte-identical files (checked by `npm test`). The Parquet files are not committed. Full scale takes about 45 s on a 10-core laptop and peaks around 5 GB of memory.
+
+## Row counts and sizes (seed 42)
+
+| file | full rows | full size | small rows | small size |
+|---|---:|---:|---:|---:|
+| tenants.parquet | 500 | 7 KB | 120 | 3 KB |
+| users.parquet | 39,097 | 341 KB | 8,854 | 79 KB |
+| usage_events.parquet | 20,000,003 | 71.6 MB | 999,997 | 4.7 MB |
+| invoices.parquet | 5,627 | 46 KB | 1,283 | 13 KB |
+| invoice_lines.parquet | 15,632 | 77 KB | 3,610 | 21 KB |
+
+Data spans 2023-01-01 to 2026-09-30.
+
+## Layout
+
+`usage_events` is sorted by `tenant_id`, then `event_time`, and written with zstd and `ROW_GROUP_SIZE 100000` (200 row groups at full scale). One tenant's events sit in 1.4 row groups on average (at most 10 for the largest), so a per-tenant range read touches few row groups.
+
+## Data dictionary
+
+### tenants
+| column | type | notes |
+|---|---|---|
+| tenant_id | INTEGER | 1..N |
+| name | VARCHAR | e.g. "Alder Freight Works" |
+| plan | VARCHAR | free, team, business, enterprise |
+| region | VARCHAR | us-east, us-west, eu-west, eu-central, ap-southeast, ap-northeast |
+| signup_date | DATE | |
+| churn_date | DATE | null while active |
+
+### users
+| column | type | notes |
+|---|---|---|
+| user_id | BIGINT | unique across tenants |
+| tenant_id | INTEGER | references tenants |
+| role | VARCHAR | owner, admin, member, viewer |
+| created_at | TIMESTAMP | on or after tenant signup, before churn |
+
+### usage_events
+| column | type | notes |
+|---|---|---|
+| event_id | BIGINT | 1..N in file order |
+| tenant_id | INTEGER | references tenants |
+| user_id | BIGINT | references users, same tenant, created before the event |
+| feature | VARCHAR | 15 features: dashboards, reports, search, exports, api_calls, alerts, integrations, workflows, sharing, comments, audit_log, sso_login, data_import, custom_fields, ai_assistant (lower plans see fewer) |
+| event_time | TIMESTAMP | UTC |
+| duration_ms | INTEGER | log-normal around a per-feature base; timeouts are 30000 |
+| status | VARCHAR | ok, error, timeout, rate_limited |
+
+Shape of the data: weekday traffic is 4-8x weekend traffic; time of day peaks in each tenant region's local morning and afternoon; activity ramps up after signup (and grows slowly after that) and decays over the 60 days before churn; usage per user is skewed so a few power users dominate.
+
+### invoices
+One per paying tenant (plan not free) per calendar month from signup to churn, billed in advance.
+
+| column | type | notes |
+|---|---|---|
+| invoice_id | BIGINT | |
+| tenant_id | INTEGER | paying tenants only |
+| period_start, period_end | DATE | calendar month |
+| issue_date, due_date | DATE | issue = period start, net 30 |
+| seats | INTEGER | users created by period end (min 1) |
+| amount | DECIMAL(12,2) | USD, equals the sum of its lines |
+| currency | VARCHAR | USD |
+| status | VARCHAR | paid, overdue |
+| paid_date | DATE | null when overdue |
+
+### invoice_lines
+| column | type | notes |
+|---|---|---|
+| line_id | BIGINT | |
+| invoice_id | BIGINT | references invoices |
+| line_type | VARCHAR | platform_fee, seats, storage_addon, api_overage, premium_support |
+| description | VARCHAR | |
+| quantity | DOUBLE | |
+| unit_price | DECIMAL(10,2) | |
+| amount | DECIMAL(12,2) | quantity x unit_price |
+
+## License
+
+MIT, same as the repository. Synthetic; any resemblance to real companies is coincidental.
