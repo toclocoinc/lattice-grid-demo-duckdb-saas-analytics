@@ -7,7 +7,7 @@
  * `tools/serve.mjs`, for development against a set you built yourself
  * (`npm run build-data -- --scale small`).
  */
-export const DATA_URL = 'https://data.latticegrid.dev/duckdb/lattice-grid-demo-duckdb-saas-analytics/';
+export const DATA_URL = 'https://data.latticegrid.dev/duckdb/lattice-grid-demo-duckdb-saas-analytics/v2/';
 export const LOCAL_DATA_URL = './data/';
 
 /** The data folder in force for this page load. Always ends in a slash. */

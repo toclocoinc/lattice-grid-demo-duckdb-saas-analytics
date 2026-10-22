@@ -245,7 +245,7 @@ export async function generate({ seed = 42, scale = 'full', out, log = () => {} 
   for (const [table, name, order, rg] of TABLES) {
     const path = resolve(dir, `${name}.parquet`);
     rmSync(path, { force: true });
-    await con.run(`COPY (SELECT * FROM ${table} ORDER BY ${order}) TO '${path.replace(/'/g, "''")}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE ${rg})`);
+    await con.run(`COPY (SELECT * FROM ${table} ORDER BY ${order}) TO '${path.replace(/'/g, "''")}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE ${rg}, WRITE_BLOOM_FILTER false)`);
     const rows = Number((await (await con.runAndReadAll(`SELECT count(*) FROM ${table}`)).getRows())[0][0]);
     files[name] = { rows, bytes: statSync(path).size };
     log(`wrote ${name}.parquet: ${rows} rows, ${files[name].bytes} bytes`);
