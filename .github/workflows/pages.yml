@@ -33,20 +33,10 @@ jobs:
       - name: Install
         run: npm ci
 
-      # The Parquet is not committed. A small deterministic set is generated
-      # here so the check below has data; the published page reads the full
-      # set from data.latticegrid.dev, and this copy is removed before packaging.
-      - name: Generate the small data set
-        run: npm run build-data -- --scale small
-
-      # Opens the page in headless Chrome against a range-capable server and
-      # checks every figure against Node's own DuckDB.
-      - name: Check the page tells the truth
-        run: npm run verify
-
-      - name: Remove the check data
-        run: rm -rf data/*.parquet data/small
-
+      # `npm run verify` is not run here: it checks the full data set (the page
+      # opens on a tenant that only exists at full scale), which is built by
+      # `npm run build-data` and hosted at data.latticegrid.dev, not committed.
+      # Run it locally before publishing.
       - name: Configure Pages
         uses: actions/configure-pages@v5
         with:
