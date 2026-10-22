@@ -13,7 +13,7 @@
     "build-data": "node tools/build-parquet.mjs"
   },
   "dependencies": {
-    "@toclocoinc/lattice-grid": "^1.111.1"
+    "@toclocoinc/lattice-grid": "1.111.7"
   },
   "engines": {
     "node": ">=22"
