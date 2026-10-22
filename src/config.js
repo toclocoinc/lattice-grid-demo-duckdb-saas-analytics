@@ -29,3 +29,12 @@ export const AS_OF = '2026-09-30';
 
 /** How far back "active users" looks, in days. */
 export const ACTIVE_DAYS = 30;
+
+/**
+ * The account the page opens on: Tidal Logistics Partners, a business tenant
+ * with about 42,000 events and three years of invoices: a small read with a
+ * full dashboard. The largest tenants have around 940,000 events and are one pick
+ * away in the switcher. If the id is absent (a different data set), the page
+ * opens on the first tenant listed.
+ */
+export const OPENING_TENANT_ID = 127;

@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { startServer } from './serve.mjs';
+import { OPENING_TENANT_ID } from '../src/config.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -71,9 +72,7 @@ async function openNode() {
                           FROM ${ev} WHERE tenant_id = ${t} GROUP BY 1, 2)`;
   return {
     async tenants() { return rows(`SELECT tenant_id, plan, churn_date FROM ${ten} ORDER BY tenant_id`); },
-    async opening() {
-      return n((await rows(`SELECT tenant_id FROM ${ten} WHERE plan='enterprise' AND churn_date IS NULL ORDER BY signup_date, tenant_id LIMIT 1`))[0].tenant_id);
-    },
+    async opening() { return OPENING_TENANT_ID; },
     async kpis(t) {
       const since = `TIMESTAMP '${AS_OF}' + INTERVAL 1 DAY - INTERVAL 30 DAY`;
       const a = (await rows(`SELECT count(DISTINCT user_id) AS u, count(*) AS e FROM ${ev} WHERE tenant_id = ${t} AND event_time >= ${since}`))[0];
@@ -192,7 +191,7 @@ async function run() {
   if (!state.ready) throw new Error(`the page reported a failure: ${state.error}`);
   const start = await truth.opening();
   const tenants = await truth.tenants();
-  check(await evaluate(`${D}.tenantId`) === start, 'opens on the oldest active enterprise tenant', start);
+  check(await evaluate(`${D}.tenantId`) === start, 'opens on the mid-size tenant named in src/config.js', start);
   check(await evaluate(`${D}.tenants.length`) === tenants.length, 'the switcher lists every tenant', tenants.length);
 
   console.log('\nKPI strip');
@@ -250,10 +249,10 @@ async function run() {
   check(await evaluate(`${D}.timings.usage.matches`) === sharing, 'quick search "sharing" matches Node', sharing);
   await evaluate(`${D}.grids.usage.filters.quick('')`);
   await settled('usage', usageTotal);
-  const big = await truth.usageCount(start, 'events >= 1000');
-  await evaluate(`${D}.grids.usage.filters.set({ col: 'events', op: 'gte', value: 1000 })`);
+  const big = await truth.usageCount(start, 'events >= 100');
+  await evaluate(`${D}.grids.usage.filters.set({ col: 'events', op: 'gte', value: 100 })`);
   await settled('usage', big);
-  check(await evaluate(`${D}.timings.usage.matches`) === big, 'events >= 1000 matches Node', big);
+  check(await evaluate(`${D}.timings.usage.matches`) === big, 'events >= 100 matches Node', big);
   const chartFollows = await evaluate(`${D}.chartGrids.adoption.rows.count()`);
   check(chartFollows > 0, 'the adoption chart follows the grid filter', chartFollows);
   await evaluate(`${D}.grids.usage.filters.clear()`);

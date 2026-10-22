@@ -53,6 +53,60 @@ body {
 .loading h1 { font-size: 1.5rem; margin: 0 0 10px; }
 .loading-message { color: var(--ink-2); margin: 6px 0; }
 
+/* The status line (spinner, words, bar) and the cover over a panel that is still waiting. */
+.spinner {
+  display: inline-block;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: 3px solid var(--rule);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+.load-status {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 8px 12px;
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  background: var(--surface);
+  padding: 14px 16px;
+  text-align: left;
+}
+.load-status[hidden], .panel-loading[hidden], .load-bar[hidden] { display: none; }
+.load-text { margin: 0; color: var(--ink); font-size: 14.5px; }
+.load-bar {
+  grid-column: 1 / -1;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--rule);
+  overflow: hidden;
+}
+.load-fill { height: 100%; width: 0; background: var(--accent); border-radius: 4px; transition: width 0.25s ease-out; }
+.loading .load-status { margin-top: 22px; }
+.slot { position: relative; min-width: 0; }
+.panel-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 16px;
+  border-radius: 9px;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 14px;
+  text-align: center;
+}
+.panel-loading p { margin: 0; }
+
 /* -------------------------------------------------------- masthead */
 .masthead { border-bottom: 2px solid var(--ink); padding-bottom: 16px; }
 .title-row { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; }
@@ -104,6 +158,7 @@ body {
 
 /* ------------------------------------------------------------- KPIs */
 .kpi-strip { min-height: 96px; }
+.slot > .kpi-strip { height: 100%; }
 
 /* ----------------------------------------------------------- charts */
 .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }

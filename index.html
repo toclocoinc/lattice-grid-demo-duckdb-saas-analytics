@@ -16,7 +16,11 @@
     <main id="app">
       <div class="loading">
         <h1>Your customers’ dashboards, served from Parquet</h1>
-        <p class="loading-message">Starting...</p>
+        <div class="load-status" role="status" aria-live="polite">
+          <span class="spinner"></span>
+          <p class="load-text">Starting. The first visit downloads the query engine, so it takes a moment.</p>
+          <div class="load-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden><div class="load-fill"></div></div>
+        </div>
       </div>
     </main>
     <script type="module" src="./main.js"></script>

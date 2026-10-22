@@ -9,6 +9,7 @@ import { createKPI } from './node_modules/@toclocoinc/lattice-grid/modules/kpi.e
 import { DEMO_LICENCE } from './src/licence.js';
 import { startDuckDB, recordingConnection } from './src/duckdb.js';
 import { buildDashboard } from './src/dashboard.js';
+import { createStatus, megabytes } from './src/loading.js';
 
 /* Applied before anything is drawn: a grid keeps the licence in force when it was built. */
 LG.setLicence(DEMO_LICENCE);
@@ -33,6 +34,7 @@ document.addEventListener('click', (event) => {
   }
 });
 
+/** The failure screen: replaces everything with what went wrong. */
 function panel(title, message, extra) {
   root.textContent = '';
   const box = document.createElement('div');
@@ -50,17 +52,23 @@ function panel(title, message, extra) {
     box.append(e);
   }
   root.append(box);
-  return (next) => { p.textContent = next; };
 }
 
 async function start() {
   const started = performance.now();
-  const update = panel(TITLE, 'Starting DuckDB in your browser...');
+  /* The status line is in index.html, so it is there from first paint. */
+  const status = createStatus(root.querySelector('.load-status'));
   try {
-    const { connection, version, close } = await startDuckDB(update);
-    update('Opening the Parquet files...');
+    const { connection, version, close, reads } = await startDuckDB(
+      (message) => status.set(message),
+      ({ loaded, total }) => status.set(
+        `Downloading the query engine (${megabytes(total)}, first visit only): ${megabytes(loaded)} of ${megabytes(total)}`,
+        loaded / total,
+      ),
+    );
+    status.set('Reading the customer list');
     const built = await buildDashboard({
-      root, LG, createChart, createKPI, connection, recordSql: recordingConnection, duckdbVersion: version,
+      root, LG, createChart, createKPI, connection, recordSql: recordingConnection, duckdbVersion: version, reads, status,
     });
     applyTheme(document.documentElement.dataset.theme);
     window.addEventListener('pagehide', () => { built.destroy(); close(); }, { once: true });

@@ -31,6 +31,20 @@ export const eventsScopeSql = (base) => `CREATE OR REPLACE TEMP TABLE ${EVENTS_T
   FROM read_parquet(${quote(`${base}usage_events.parquet`)})
   WHERE tenant_id = ?`;
 
+/**
+ * How many bytes of the events file the working-set read will fetch for one
+ * tenant: the compressed size of the six columns it reads, in the row groups
+ * whose tenant_id range holds the tenant. Read from the file's footer, which
+ * the engine has to fetch anyway; it is what the "n of m MB" line counts to.
+ */
+export const eventsReadBytesSql = (base) => {
+  const file = quote(`${base}usage_events.parquet`);
+  return `SELECT CAST(sum(total_compressed_size) AS BIGINT) AS bytes FROM parquet_metadata(${file})
+  WHERE path_in_schema IN ('tenant_id', 'user_id', 'feature', 'event_time', 'duration_ms', 'status')
+    AND row_group_id IN (SELECT row_group_id FROM parquet_metadata(${file})
+      WHERE path_in_schema = 'tenant_id' AND CAST(stats_min_value AS BIGINT) <= ? AND CAST(stats_max_value AS BIGINT) >= ?)`;
+};
+
 /** Events per feature per week, from the tenant's own events. */
 export const usageScopeSql = () => `CREATE OR REPLACE TEMP TABLE ${USAGE_TABLE} AS
   SELECT tenant_id, feature,

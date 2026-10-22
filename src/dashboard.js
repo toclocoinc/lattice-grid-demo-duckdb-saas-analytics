@@ -17,10 +17,11 @@
  *
  * Switching tenant changes one value and re-runs the views.
  */
-import { FILES, dataBase } from './config.js';
+import { FILES, OPENING_TENANT_ID, dataBase } from './config.js';
+import { megabytes, slot } from './loading.js';
 import {
   INVOICES_TABLE, INVOICE_COLUMNS, INVOICE_FIELDS, KPI_SQL, USAGE_TABLE, TENANTS_SQL, USAGE_COLUMNS, USAGE_FIELDS,
-  eventsScopeSql, fmt, invoicesScopeSql, num, usageScopeSql,
+  eventsReadBytesSql, eventsScopeSql, fmt, invoicesScopeSql, num, usageScopeSql,
 } from './model.js';
 
 const el = (tag, className, text) => {
@@ -33,7 +34,7 @@ const el = (tag, className, text) => {
 const TOP_FEATURES = 6;
 const VIEWS = ['usage', 'invoices'];
 
-export async function buildDashboard({ root, LG, createChart, createKPI, connection, recordSql, duckdbVersion }) {
+export async function buildDashboard({ root, LG, createChart, createKPI, connection, recordSql, duckdbVersion, reads, status }) {
   const base = dataBase();
   const built = {
     ready: false,
@@ -64,12 +65,8 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     };
   });
   built.tenants = tenantRows;
-  /* The account to open on: the oldest active enterprise tenant. */
-  const firstOpen = (await connection.query(
-    `SELECT tenant_id FROM read_parquet('${base}tenants.parquet')
-     WHERE plan = 'enterprise' AND churn_date IS NULL ORDER BY signup_date, tenant_id LIMIT 1`,
-  )).toArray()[0];
-  const startTenant = firstOpen ? num(firstOpen.toJSON().tenant_id) : tenantRows[0].tenant_id;
+  /* The account to open on: a mid-size tenant (see config.js), or the first listed. */
+  const startTenant = (tenantRows.find((t) => t.tenant_id === OPENING_TENANT_ID) ?? tenantRows[0]).tenant_id;
 
   /* ------------------------------------------------------------------ */
   /* The frame                                                           */
@@ -93,6 +90,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     + 'usage, invoices and charts, scoped to one tenant and re-scoped in about a second when you switch.',
   ));
   root.append(header);
+  root.append(status.el);
 
   const tenantBar = el('section', 'tenant-bar');
   tenantBar.setAttribute('aria-label', 'Tenant');
@@ -115,16 +113,20 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
 
   const kpiHost = el('section', 'kpi-strip');
   kpiHost.setAttribute('aria-label', 'Key figures for this tenant');
-  root.append(kpiHost);
+  const kpiSlot = slot(kpiHost, 'Waiting for the usage data, then the key figures');
+  root.append(kpiSlot.el);
 
   const chartSection = el('section', 'charts');
   chartSection.setAttribute('aria-label', 'Charts');
   const chartBoxes = {};
+  const chartSlots = {};
   for (const id of ['adoption', 'mrr']) {
     const box = el('div', 'chart-box');
     box.dataset.chart = id;
-    chartSection.append(box);
+    const covered = slot(box, 'Waiting for the usage data, then this chart');
+    chartSection.append(covered.el);
     chartBoxes[id] = box;
+    chartSlots[id] = covered;
   }
   root.append(chartSection);
 
@@ -139,9 +141,10 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     section.append(head, el('p', 'view-note', blurb));
     const host = el('div', 'grid-host');
     host.dataset.grid = id;
-    section.append(host);
+    const covered = slot(host, 'Waiting for the usage data, then these rows');
+    section.append(covered.el);
     root.append(section);
-    return { host, stat };
+    return { host, stat, covered };
   };
   const views = {
     usage: viewSection('usage', 'Usage', 'Events by feature by week. Type in the search box, filter a column, click a histogram bar, or group by feature: each of those becomes SQL.'),
@@ -244,6 +247,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
         void refreshCharts(id);
       }
       notify(id);
+      requestAnimationFrame(() => views[id].covered.hide());
       return result;
     };
     built.grids[id]?.destroy?.();
@@ -273,11 +277,13 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     if (built.chartGrids[id]) {
       built.chartGrids[id].rows.load(rows);
       built.charts[id]?.refresh?.();
+      chartSlots[id].hide();
       return;
     }
     const grid = LG.createHeadlessGrid({ rowKey: 'id', columns, rows });
     built.chartGrids[id] = grid;
     built.charts[id] = createChart({ grid, container: chartBoxes[id], legend: true, ...spec });
+    chartSlots[id].hide();
   }
 
   const sequences = { usage: 0, invoices: 0 };
@@ -365,6 +371,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
       active: num(active.v), events: num(events.v), mrr: num(mrr.v), overdue: num(overdue.v), overdueAmount: num(overdue.total),
     };
     built.kpi.setRows([{ id: 'now', ...built.kpis }]);
+    kpiSlot.hide();
   }
 
   /* ------------------------------------------------------------------ */
@@ -389,6 +396,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     select.value = String(tenantId);
     scopeNote.textContent = describe(tenantId);
     switchTiming.textContent = 'Loading…';
+    status.show();
     for (const id of VIEWS) {
       const s = built.timings[id];
       s.chartsBefore = s.chartsDone;
@@ -396,8 +404,10 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     epoch += 1;
     await loadScope(tenantId);
     mountViews(tenantId);
+    status.set(`Building ${t?.name ?? 'the tenant'}’s grids, charts and key figures`);
     const settled = settledFor(tenantId);
     await Promise.all([loadKpis(), settled]);
+    status.hide();
     built.lastSwitchMs = Math.round(performance.now() - started);
     switchTiming.textContent = `${t?.name ?? 'Tenant'} loaded in ${built.lastSwitchMs} ms: working set, 4 KPIs, 2 grids, 2 charts.`;
     return built.lastSwitchMs;
@@ -415,10 +425,47 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
     const statement = await scopeConnection.prepare(sql);
     try { await statement.query(tenantId); } finally { statement.close(); }
   };
+  /** Show every panel's loading state: nothing is blank while the working set is read. */
+  const coverPanels = (name) => {
+    kpiSlot.show(`Reading ${name} usage, then the key figures`);
+    for (const id of Object.keys(chartSlots)) chartSlots[id].show(`Reading ${name} usage, then this chart`);
+    for (const id of VIEWS) views[id].covered.show(`Reading ${name} ${id}…`);
+  };
+
+  /**
+   * How many bytes the events read will fetch for this tenant (null when the
+   * file carries no statistics to say), so the status line can show a bar.
+   */
+  const expectedBytes = async (tenantId) => {
+    try {
+      const statement = await connection.prepare(eventsReadBytesSql(base));
+      try {
+        const row = (await statement.query(tenantId, tenantId)).toArray()[0]?.toJSON();
+        return num(row?.bytes) || null;
+      } finally { statement.close(); }
+    } catch { return null; }
+  };
+
   /** Build the tenant's working set: the one place the tenant id is bound. */
   const loadScope = async (tenantId) => {
+    const name = tenantRows.find((x) => x.tenant_id === tenantId)?.name ?? 'the tenant’s';
     for (const id of VIEWS) { built.grids[id]?.destroy?.(); built.grids[id] = null; views[id].host.textContent = ''; }
-    await Promise.all([bind(eventsScopeSql(base), tenantId), bind(invoicesScopeSql(base), tenantId)]);
+    coverPanels(name);
+    status.set(`Looking up where ${name} usage sits in the file`);
+    const expected = await expectedBytes(tenantId);
+    const before = reads.bytes;
+    const line = (read) => {
+      const total = Math.max(expected ?? 0, read);
+      return expected
+        ? [`Reading ${name} usage (${megabytes(read)} of ${megabytes(total)})`, read / total]
+        : [`Reading ${name} usage (${megabytes(read)} so far)`, null];
+    };
+    status.set(...line(0));
+    const stop = reads.onRead((total) => status.set(...line(total - before)));
+    try {
+      await Promise.all([bind(eventsScopeSql(base), tenantId), bind(invoicesScopeSql(base), tenantId)]);
+    } finally { stop(); }
+    status.set(`Summing ${name} usage by feature and week`);
     await scopeConnection.query(usageScopeSql());
   };
 
@@ -437,6 +484,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
   scopeNote.textContent = describe(startTenant);
   await loadScope(startTenant);
   mountViews(startTenant);
+  status.set(`Building ${tenantRows.find((x) => x.tenant_id === startTenant).name}’s grids, charts and key figures`);
   const opening = settledFor(startTenant);
   built.switchTenant = (id) => switchTenant(Number(id));
   built.group = (ids) => built.grids.usage.columns.group(ids);
@@ -444,6 +492,7 @@ export async function buildDashboard({ root, LG, createChart, createKPI, connect
 
   const t0 = tenantRows.find((x) => x.tenant_id === startTenant);
   await Promise.all([loadKpis(), opening]);
+  status.hide();
   switchTiming.textContent = `${t0.name} loaded.`;
   return built;
 }
